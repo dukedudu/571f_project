@@ -15,12 +15,7 @@ import random, pdb, math, copy
 from sklearn.metrics import confusion_matrix
 import torch.nn.functional as F
 import tqdm
-
-# node2vec
-import networkx as nx
-from collections import defaultdict
-from collections import defaultdict
-from node2vec import Node2Vec
+import time
 
 
 def op_copy(optimizer):
@@ -157,8 +152,6 @@ def cal_acc(loader, fea_bank, socre_bank, netF, netB, netC, args, flag=False):
 
     _, socre_bank_ = torch.max(socre_bank, 1)
 
-    import time
-
     splits = 4
     split_idx = num_sample // splits
     idx_near = torch.zeros(num_sample, 4, dtype=torch.long)
@@ -193,6 +186,7 @@ def cal_acc(loader, fea_bank, socre_bank, netF, netB, netC, args, flag=False):
     else:
         return accuracy * 100, mean_ent
 
+
 def cal_acc_office(loader, netF, netB, netC, flag=False):
     start_test = True
     with torch.no_grad():
@@ -216,13 +210,13 @@ def cal_acc_office(loader, netF, netB, netC, flag=False):
 
     if flag:
         matrix = confusion_matrix(all_label, torch.squeeze(predict).float())
-        acc = matrix.diagonal()/matrix.sum(axis=1) * 100
+        acc = matrix.diagonal() / matrix.sum(axis=1) * 100
         aacc = acc.mean()
         aa = [str(np.round(i, 2)) for i in acc]
         acc = ' '.join(aa)
         return aacc, acc
     else:
-        return accuracy*100, mean_ent
+        return accuracy * 100, mean_ent
 
 
 def hyper_decay(x, beta=-2, alpha=1):
@@ -315,13 +309,18 @@ def train_target(args):
     loader = dset_loaders["target"]
     num_sample = len(loader.dataset)
     fea_bank = torch.randn(num_sample, args.fea_bank_dim)  # can ca
+    # score_bank = torch.randn(num_sample, 12).cuda() # for visda only
     score_bank = torch.randn(num_sample, args.class_num).cuda()
+    # logit_bank = torch.randn(num_sample, args.class_num).cuda()
+    # source_feature_sim = np.load(r'C:\Users\wang0918.stu\Desktop\SFDA\weight\source\uda\visda-2017\TRAIN\feature_bank.npy')
+    # source_feature_sim = torch.tensor(source_feature_sim).cuda()
 
     netF.eval()
     netB.eval()
     netC.eval()
 
     # initialize
+    t1 = time.time()
     print("Initialize...")
     with torch.no_grad():
         iter_test = iter(loader)
@@ -339,36 +338,10 @@ def train_target(args):
             outputs = nn.Softmax(-1)(logits)
             fea_bank[indx] = fea_norm.detach().clone().cpu()
             score_bank[indx] = outputs.detach().clone()  # .cpu()
-
+    t2 = time.time()
+    print("banking time: ", t2 - t1)
     max_iter = args.max_epoch * len(dset_loaders["target"])
     interval_iter = max_iter // args.interval
-
-    # construct graph
-    if args.node2vec_sampling:
-        print("generating node embedding")
-        num_sample = len(loader.dataset)
-        all_fea = (fea_bank.t() / torch.norm(fea_bank, p=2, dim=1)).t()
-        edge = all_fea @ all_fea.T
-        adj = edge.detach().clone().cpu().numpy()
-        K = score_bank.size(1)
-        graph = nx.Graph()
-        feature_dict = defaultdict(list)
-        for i, v in enumerate(score_bank):
-            feature_dict[i] = v
-        graph.add_nodes_from(np.arange(num_sample))
-        nx.set_node_attributes(graph, feature_dict, "prob")
-        for i in range(num_sample):
-            for j in range(num_sample):
-                if args.cut_edges and adj[i][j] < args.weight_thres:
-                    continue
-                graph.add_edge(i, j, weight=adj[i][j])
-        print(args.walk_length, args.walk_num)
-        node2vec = Node2Vec(graph, dimensions=K, walk_length=args.walk_length, num_walks=args.walk_num,
-                            workers=4)  # Use temp_folder for big graphs
-        model = node2vec.fit(window=10, min_count=1, batch_words=4)
-        prob_lookup = model.wv
-        print("node embedding complete")
-
     iter_num = 0
 
     netF.train()
@@ -407,53 +380,32 @@ def train_target(args):
         logits_test = netC(logits_test)
         softmax_out = nn.Softmax(dim=1)(logits_test)
 
-        # node2vec
-        if args.node2vec_sampling:
-            tar_idx_batch = tar_idx.detach().clone().cpu().numpy().tolist()
-            tar_idx_batch = [str(ele) for ele in tar_idx_batch]
-            prob_from_node2vec = torch.from_numpy(prob_lookup[tar_idx_batch]).float().to(torch.device("cuda:0"))
-            # prob_dist_loss = nn.CrossEntropyLoss()(softmax_out, prob_from_node2vec)
-
         with torch.no_grad():
             output_f_ = output_f_norm.cpu().detach().clone()
             fea_bank[tar_idx] = output_f_.detach().clone().cpu()
             score_bank[tar_idx] = softmax_out.detach().clone()
 
-        # distance = output_f_ @ fea_bank.T  # batch*num_sample
-        #
-        # _, idx_near = torch.topk(distance,
-        #                          dim=-1,
-        #                          largest=True,
-        #                          k=args.K + 1)
-        # idx_near = idx_near[:, 1:]  # batch x K
-        #
-        # score_near = score_bank[idx_near]  # batch x K x C
-        #
-        # score_nearest = score_near[:, 0].view(-1, 12)
-        # neighbor = []
-        # for index in tar_idx_batch:
-        #   n_index = prob_lookup.most_similar(index)[0][0]
-        #   neighbor.append(n_index)
-        # neighbor = [str(ele) for ele in neighbor]
-        # score_nearest = torch.from_numpy(prob_lookup[neighbor]).float().to(torch.device("cuda:0"))
-        neighbor = []
-        for index in tar_idx_batch:
-          n_index = int(prob_lookup.most_similar(index)[0][0])
-          neighbor.append(n_index)
-        neighbor = [str(ele) for ele in neighbor]
-        neighbor = torch.tensor(neighbor).cuda()
-        score_nearest = score_bank[neighbor]
-        # score_nearest = prob_lookup.most_similar(tar_idx_batch)
-        # print(score_nearest)
-        # score_nearest = torch.stack(score_nearest)
-        print(score_nearest.size(), softmax_out.size())
+        distance = output_f_ @ fea_bank.T  # batch*num_sample
 
-        feature = torch.cat([softmax_out, score_nearest], dim=0)
+        _, idx_near = torch.topk(distance,
+                                 dim=-1,
+                                 largest=True,
+                                 k=args.K + 1)
+        idx_near = idx_near[:, 1:]  # batch x K
+
+        score_near = score_bank[idx_near]  # batch x K x C
+
+        score_nearest = score_near[:, 0].view(-1, args.class_num)
+        softmax_out_un = softmax_out.unsqueeze(1).expand(-1, 1, -1).reshape(-1, args.class_num)
+        ###################################################################
+        ################## Our Implementation #####################
+        ###################################################################
+
+        feature = torch.cat([softmax_out_un, score_nearest], dim=0)
         labels = torch.cat([torch.arange(softmax_out.shape[0]).repeat_interleave(1) for i in range(2)], dim=0)
         labels = (labels.unsqueeze(0) == labels.unsqueeze(1)).float()
         labels = labels.cuda()
         similarity_matrix = feature @ feature.T
-        
 
         A = torch.ones(labels.shape[0], 1, 1, dtype=torch.bool)
         mask = torch.block_diag(*A).cuda()
@@ -472,12 +424,6 @@ def train_target(args):
         logits = logits / args.temperature
 
         loss = criterion(logits, labels)
-
-        # score_near_mean = torch.mean(score_near, 1)
-        # soft_score_loss = torch.mean(-torch.sum(score_near_mean * torch.log(softmax_out), 1, keepdim=True))
-        # loss = soft_score_loss
-        if args.node2vec_sampling:
-            loss += prob_dist_loss
 
         optimizer.zero_grad()
         optimizer_c.zero_grad()
@@ -508,14 +454,28 @@ def train_target(args):
             else:
                 acc_s_te, _ = cal_acc_office(dset_loaders['test'], netF, netB, netC, False)
                 log_str = 'Task: {}, Iter:{}/{}; Accuracy = {:.2f}%'.format(args.name, iter_num, max_iter, acc_s_te)
-        
 
             args.out_file.write(log_str + '\n')
             args.out_file.flush()
             print(log_str + '\n')
             netF.train()
             netB.train()
+            # netF.eval()
+            # netB.eval()
             netC.train()
+            '''if acc>acc_log:
+                acc_log = acc
+                torch.save(
+                    netF.state_dict(),
+                    osp.join(args.output_dir, "target_F_" + '2021_'+str(args.tag) + ".pt"))
+                torch.save(
+                    netB.state_dict(),
+                    osp.join(args.output_dir,
+                                "target_B_" + '2021_' + str(args.tag) + ".pt"))
+                torch.save(
+                    netC.state_dict(),
+                    osp.join(args.output_dir,
+                                "target_C_" + '2021_' + str(args.tag) + ".pt"))'''
 
     return netF, netB, netC
 
@@ -553,7 +513,7 @@ if __name__ == "__main__":
     parser.add_argument('--lr', type=float, default=1e-4, help="learning rate")
     parser.add_argument('--fea_bank_dim', type=float, default=2048, help="feature bank dimension")
     parser.add_argument('--net', type=str, default='resnet101')
-    parser.add_argument('--seed', type=int, default=2020, help="random seed")
+    parser.add_argument('--seed', type=int, default=2021, help="random seed")
 
     parser.add_argument('--bottleneck', type=int, default=256)
     parser.add_argument('--K', type=int, default=5)
@@ -580,15 +540,6 @@ if __name__ == "__main__":
     parser.add_argument('--temperature', default=0.07, type=float,
                         help='softmax temperature (default: 0.07)')
     parser.add_argument('--dataset_folder', type=str, default="C:/Users/wang0918.stu/Desktop/Datasets")
-
-    # node2vec
-    parser.add_argument('--cut_edges', type=bool, default=True)
-    parser.add_argument('--weight_thres', type=float, default=0.02)
-    parser.add_argument('--node2vec_sampling', type=bool, default=False)
-    parser.add_argument('--graph_folder', type=str, default=None)
-    parser.add_argument('--walk_length', type=int, default=16)
-    parser.add_argument('--walk_num', type=int, default=128)
-
     args = parser.parse_args()
 
     if args.dset == 'office-home':
