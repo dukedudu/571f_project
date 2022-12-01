@@ -193,6 +193,37 @@ def cal_acc(loader, fea_bank, socre_bank, netF, netB, netC, args, flag=False):
     else:
         return accuracy * 100, mean_ent
 
+def cal_acc_office(loader, netF, netB, netC, flag=False):
+    start_test = True
+    with torch.no_grad():
+        iter_test = iter(loader)
+        for i in range(len(loader)):
+            data = iter_test.next()
+            inputs = data[0]
+            labels = data[1]
+            inputs = inputs.cuda()
+            outputs = netC(netB(netF(inputs)))
+            if start_test:
+                all_output = outputs.float().cpu()
+                all_label = labels.float()
+                start_test = False
+            else:
+                all_output = torch.cat((all_output, outputs.float().cpu()), 0)
+                all_label = torch.cat((all_label, labels.float()), 0)
+    _, predict = torch.max(all_output, 1)
+    accuracy = torch.sum(torch.squeeze(predict).float() == all_label).item() / float(all_label.size()[0])
+    mean_ent = torch.mean(loss.Entropy(nn.Softmax(dim=1)(all_output))).cpu().data.item()
+
+    if flag:
+        matrix = confusion_matrix(all_label, torch.squeeze(predict).float())
+        acc = matrix.diagonal()/matrix.sum(axis=1) * 100
+        aacc = acc.mean()
+        aa = [str(np.round(i, 2)) for i in acc]
+        acc = ' '.join(aa)
+        return aacc, acc
+    else:
+        return accuracy*100, mean_ent
+
 
 def hyper_decay(x, beta=-2, alpha=1):
     weight = (1 + 10 * x) ** (-beta) * alpha
@@ -254,24 +285,12 @@ def train_target(args):
                                    class_num=args.class_num,
                                    bottleneck_dim=args.bottleneck).cuda()
 
-    # netF_source = network.ResBase(res_name='resnet101').cuda()
-    #
-    # netB_source = network.feat_bootleneck(type=args.classifier,
-    #                                feature_dim=2048,
-    #                                bottleneck_dim=args.bottleneck).cuda()
-    # netC_source = network.feat_classifier(type=args.layer,
-    #                                class_num=args.class_num,
-    #                                bottleneck_dim=args.bottleneck).cuda()
-
     modelpath = args.output_dir_src + '/source_F.pt'
     netF.load_state_dict(torch.load(modelpath))
-    # netF_source.load_state_dict(torch.load(modelpath))
     modelpath = args.output_dir_src + '/source_B.pt'
     netB.load_state_dict(torch.load(modelpath))
-    # netB_source.load_state_dict(torch.load(modelpath))
     modelpath = args.output_dir_src + '/source_C.pt'
     netC.load_state_dict(torch.load(modelpath))
-    # netC_source.load_state_dict(torch.load(modelpath))
 
     param_group = []
     param_group_c = []
@@ -309,7 +328,6 @@ def train_target(args):
         for i in tqdm.tqdm(range(len(loader))):
             # for i in range(10):
             data = iter_test.next()
-            # print('what is in data:', data[0], data[-1])
 
             inputs = data[0]
             indx = data[-1]
@@ -344,7 +362,8 @@ def train_target(args):
                 if args.cut_edges and adj[i][j] < args.weight_thres:
                     continue
                 graph.add_edge(i, j, weight=adj[i][j])
-        node2vec = Node2Vec(graph, dimensions=K, walk_length=10, num_walks=200,
+        print(args.walk_length, args.walk_num)
+        node2vec = Node2Vec(graph, dimensions=K, walk_length=args.walk_length, num_walks=args.walk_num,
                             workers=4)  # Use temp_folder for big graphs
         model = node2vec.fit(window=10, min_count=1, batch_words=4)
         prob_lookup = model.wv
@@ -355,9 +374,6 @@ def train_target(args):
     netF.train()
     netB.train()
     netC.train()
-    # netF_source.eval()
-    # netB_source.eval()
-    # netC_source.eval()
     acc_log = 0
 
     real_max_iter = max_iter
@@ -396,7 +412,7 @@ def train_target(args):
             tar_idx_batch = tar_idx.detach().clone().cpu().numpy().tolist()
             tar_idx_batch = [str(ele) for ele in tar_idx_batch]
             prob_from_node2vec = torch.from_numpy(prob_lookup[tar_idx_batch]).float().to(torch.device("cuda:0"))
-            prob_dist_loss = nn.CrossEntropyLoss()(softmax_out, prob_from_node2vec)
+            # prob_dist_loss = nn.CrossEntropyLoss()(softmax_out, prob_from_node2vec)
 
         with torch.no_grad():
             output_f_ = output_f_norm.cpu().detach().clone()
@@ -414,10 +430,18 @@ def train_target(args):
         # score_near = score_bank[idx_near]  # batch x K x C
         #
         # score_nearest = score_near[:, 0].view(-1, 12)
-        softmax_out = prob_lookup.wv.most_similar(tar_idx_batch)
-        softmax_out_un = softmax_out.unsqueeze(1).expand(-1, 1, -1).reshape(-1, 12)
+        neighbor = []
+        for index in tar_idx_batch:
+          n_index = prob_lookup.most_similar(index)[0][0]
+          neighbor.append(n_index)
+        neighbor = [str(ele) for ele in neighbor]
+        score_nearest = torch.from_numpy(prob_lookup[neighbor]).float().to(torch.device("cuda:0"))
+        # score_nearest = prob_lookup.most_similar(tar_idx_batch)
+        # print(score_nearest)
+        # score_nearest = torch.stack(score_nearest)
+        print(score_nearest.size(), softmax_out.size())
 
-        feature = torch.cat([softmax_out_un, score_nearest], dim=0)
+        feature = torch.cat([softmax_out, score_nearest], dim=0)
         labels = torch.cat([torch.arange(softmax_out.shape[0]).repeat_interleave(1) for i in range(2)], dim=0)
         labels = (labels.unsqueeze(0) == labels.unsqueeze(1)).float()
         labels = labels.cuda()
@@ -473,6 +497,10 @@ def train_target(args):
                     args.name, iter_num, max_iter, iter_num // len(dset_loaders["target"]), args.max_epoch, acc,
                                                    acc1_knn * 100,
                                                    acc2_knn * 100) + '\n' + 'T: ' + accc
+            else:
+                acc_s_te, _ = cal_acc_office(dset_loaders['test'], netF, netB, netC, False)
+                log_str = 'Task: {}, Iter:{}/{}; Accuracy = {:.2f}%'.format(args.name, iter_num, max_iter, acc_s_te)
+        
 
             args.out_file.write(log_str + '\n')
             args.out_file.flush()
@@ -504,7 +532,7 @@ if __name__ == "__main__":
                         type=int,
                         default=10,
                         help="max iterations")
-    parser.add_argument('--interval', type=int, default=150)
+    parser.add_argument('--interval', type=int, default=15)
     parser.add_argument('--batch_size',
                         type=int,
                         default=64,
@@ -517,7 +545,7 @@ if __name__ == "__main__":
     parser.add_argument('--lr', type=float, default=1e-4, help="learning rate")
     parser.add_argument('--fea_bank_dim', type=float, default=2048, help="feature bank dimension")
     parser.add_argument('--net', type=str, default='resnet101')
-    parser.add_argument('--seed', type=int, default=2021, help="random seed")
+    parser.add_argument('--seed', type=int, default=2020, help="random seed")
 
     parser.add_argument('--bottleneck', type=int, default=256)
     parser.add_argument('--K', type=int, default=5)
