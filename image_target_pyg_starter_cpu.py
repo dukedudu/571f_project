@@ -225,7 +225,7 @@ def train_target_node2vec(args):
             # todo: customize mse loss
             # todo: try different losses (KL divergence)
             feat_loss = nn.MSELoss()
-            feat_dist_loss = torch.mean(feat_loss(features_test, torch.from_numpy(fea_lookup[tar_idx_batch])))
+            feat_dist_loss = torch.mean(feat_loss(features_test, fea_lookup[tar_idx_batch]))
             feat_dist_loss *= args.cls_par
             # test 2: using tensor (no grad)
             # feat_dist_loss = nn.MSELoss()
@@ -528,7 +528,7 @@ def obtain_vec(loader, netF, netB, netC, args):
     fea_lookup = model(torch.arange(num_sample))
 
 
-    return all_fea, edge_index, fea_lookup.detach().numpy()
+    return all_fea, edge_index, fea_lookup.detach()
 
     # ent = torch.sum(-all_output * torch.log(all_output + args.epsilon), dim=1)
     # unknown_weight = 1 - ent / np.log(args.class_num)
