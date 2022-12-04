@@ -14,19 +14,14 @@ import random, pdb, math, copy
 from tqdm import tqdm
 from scipy.spatial.distance import cdist
 from sklearn.metrics import confusion_matrix
-import torch.nn.functional as F
-import networkx as nx
-from collections import defaultdict
-# from node2vec import Node2Vec
 from torch_geometric.nn import GraphSAGE
 
-
-# from torch_geometric.nn import Node2Vec
 
 def op_copy(optimizer):
     for param_group in optimizer.param_groups:
         param_group['lr0'] = param_group['lr']
     return optimizer
+
 
 def lr_scheduler(optimizer, iter_num, max_iter, gamma=10, power=0.75):
     decay = (1 + gamma * iter_num / max_iter) ** (-power)
@@ -37,13 +32,14 @@ def lr_scheduler(optimizer, iter_num, max_iter, gamma=10, power=0.75):
         param_group['nesterov'] = True
     return optimizer
 
+
 def image_train(resize_size=256, crop_size=224, alexnet=False):
-  if not alexnet:
-    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                   std=[0.229, 0.224, 0.225])
-  else:
-    normalize = Normalize(meanfile='./ilsvrc_2012_mean.npy')
-  return  transforms.Compose([
+    if not alexnet:
+        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                         std=[0.229, 0.224, 0.225])
+    else:
+        normalize = Normalize(meanfile='./ilsvrc_2012_mean.npy')
+    return transforms.Compose([
         transforms.Resize((resize_size, resize_size)),
         transforms.RandomCrop(crop_size),
         transforms.RandomHorizontalFlip(),
@@ -51,20 +47,22 @@ def image_train(resize_size=256, crop_size=224, alexnet=False):
         normalize
     ])
 
+
 def image_test(resize_size=256, crop_size=224, alexnet=False):
-  if not alexnet:
-    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                   std=[0.229, 0.224, 0.225])
-  else:
-    normalize = Normalize(meanfile='./ilsvrc_2012_mean.npy')
-  return  transforms.Compose([
+    if not alexnet:
+        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                         std=[0.229, 0.224, 0.225])
+    else:
+        normalize = Normalize(meanfile='./ilsvrc_2012_mean.npy')
+    return transforms.Compose([
         transforms.Resize((resize_size, resize_size)),
         transforms.CenterCrop(crop_size),
         transforms.ToTensor(),
         normalize
     ])
 
-def data_load(args): 
+
+def data_load(args):
     ## prepare data
     dsets = {}
     dset_loaders = {}
@@ -83,20 +81,23 @@ def data_load(args):
             reci = rec.strip().split(' ')
             if int(reci[1]) in args.tar_classes:
                 if int(reci[1]) in args.src_classes:
-                    line = reci[0] + ' ' + str(label_map_s[int(reci[1])]) + '\n'   
+                    line = reci[0] + ' ' + str(label_map_s[int(reci[1])]) + '\n'
                     new_tar.append(line)
                 else:
-                    line = reci[0] + ' ' + str(len(label_map_s)) + '\n'   
+                    line = reci[0] + ' ' + str(len(label_map_s)) + '\n'
                     new_tar.append(line)
         txt_tar = new_tar.copy()
         txt_test = txt_tar.copy()
 
     dsets["target"] = ImageList_idx(txt_tar, transform=image_train())
-    dset_loaders["target"] = DataLoader(dsets["target"], batch_size=train_bs, shuffle=True, num_workers=args.worker, drop_last=False)
+    dset_loaders["target"] = DataLoader(dsets["target"], batch_size=train_bs, shuffle=True, num_workers=args.worker,
+                                        drop_last=False)
     dsets["test"] = ImageList_idx(txt_test, transform=image_test())
-    dset_loaders["test"] = DataLoader(dsets["test"], batch_size=train_bs*3, shuffle=False, num_workers=args.worker, drop_last=False)
+    dset_loaders["test"] = DataLoader(dsets["test"], batch_size=train_bs * 3, shuffle=False, num_workers=args.worker,
+                                      drop_last=False)
 
     return dset_loaders
+
 
 def cal_acc(loader, netF, netB, netC, flag=False):
     start_test = True
@@ -121,13 +122,13 @@ def cal_acc(loader, netF, netB, netC, flag=False):
 
     if flag:
         matrix = confusion_matrix(all_label, torch.squeeze(predict).float())
-        acc = matrix.diagonal()/matrix.sum(axis=1) * 100
+        acc = matrix.diagonal() / matrix.sum(axis=1) * 100
         aacc = acc.mean()
         aa = [str(np.round(i, 2)) for i in acc]
         acc = ' '.join(aa)
         return aacc, acc
     else:
-        return accuracy*100, mean_ent
+        return accuracy * 100, mean_ent
 
 
 def train_target_node2vec(args):
@@ -197,10 +198,6 @@ def train_target_node2vec(args):
         outputs_test = netC(features_test)
 
         if args.cls_par > 0:  # batch level
-            # node[tar_idx] = features_test
-            # edge[tar_idx] = nn.Softmax(dim=1)(outputs_test)
-            # pred = mem_label[tar_idx]  # feature bank
-            # test 1: using numpy array
             tar_idx_batch = tar_idx.detach().clone().cpu().numpy()
             # todo: customize mse loss
             # todo: try different losses (KL divergence)
@@ -210,8 +207,6 @@ def train_target_node2vec(args):
             if iter_num < interval_iter and args.dset == "VISDA-C":
                 feat_dist_loss *= 0
         else:
-            # classifier_loss = torch.tensor(0.0).cuda()
-            # classifier_loss = torch.tensor(0.0)
             feat_dist_loss = torch.tensor(0.0).cuda()
         if args.ent:
             softmax_out = nn.Softmax(dim=1)(outputs_test)
@@ -251,6 +246,7 @@ def train_target_node2vec(args):
 
     return netF, netB, netC
 
+
 def print_args(args):
     s = "==========================================\n"
     for arg, content in args.__dict__.items():
@@ -261,10 +257,6 @@ def print_args(args):
 def obtain_vec(loader, netF, netB, netC, args):
     print("generating node embedding")
     num_sample = len(loader.dataset)
-    # fea_bank = torch.randn(num_sample, 256)
-    # score_bank = torch.randn(num_sample, 12).cuda()
-    # score_bank = torch.randn(num_sample, 30)   # change class num
-    # office: 30; office-home: 65; visda-2017: 12
     start_test = True
     with torch.no_grad():
         iter_test = iter(loader)
@@ -303,7 +295,6 @@ def obtain_vec(loader, netF, netB, netC, args):
         predict = labelset[pred_label]
 
         aff = np.eye(K)[predict]
-    # feat_bank[-args.class_num:] = torch.from_numpy(initc)
     super_node_embedding = torch.from_numpy(initc)
     print("generating class supernode complete...")
 
@@ -341,6 +332,7 @@ def obtain_vec(loader, netF, netB, netC, args):
 
     return all_fea, edge_index, fea_lookup.detach()
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='SHOT')
     parser.add_argument('--gpu_id', type=str, nargs='?', default='0', help="device id to run")
@@ -350,11 +342,12 @@ if __name__ == "__main__":
     parser.add_argument('--interval', type=int, default=15)
     parser.add_argument('--batch_size', type=int, default=64, help="batch_size")
     parser.add_argument('--worker', type=int, default=4, help="number of workers")
-    parser.add_argument('--dset', type=str, default='office-home', choices=['VISDA-C', 'office', 'office-home', 'office-caltech'])
+    parser.add_argument('--dset', type=str, default='office-home',
+                        choices=['VISDA-C', 'office', 'office-home', 'office-caltech'])
     parser.add_argument('--lr', type=float, default=1e-2, help="learning rate")
     parser.add_argument('--net', type=str, default='resnet50', help="alexnet, vgg16, resnet50, res101")
     parser.add_argument('--seed', type=int, default=2020, help="random seed")
- 
+
     parser.add_argument('--gent', type=bool, default=True)
     parser.add_argument('--ent', type=bool, default=True)
     parser.add_argument('--threshold', type=int, default=0)
@@ -367,7 +360,7 @@ if __name__ == "__main__":
     parser.add_argument('--epsilon', type=float, default=1e-5)
     parser.add_argument('--layer', type=str, default="wn", choices=["linear", "wn"])
     parser.add_argument('--classifier', type=str, default="bn", choices=["ori", "bn"])
-    parser.add_argument('--distance', type=str, default='cosine', choices=["euclidean", "cosine"])  
+    parser.add_argument('--distance', type=str, default='cosine', choices=["euclidean", "cosine"])
     parser.add_argument('--output', type=str, default='san')
     parser.add_argument('--output_src', type=str, default='san')
     parser.add_argument('--da', type=str, default='uda', choices=['uda', 'pda'])
@@ -378,7 +371,7 @@ if __name__ == "__main__":
 
     if args.dset == 'office-home':
         names = ['Art', 'Clipart', 'Product', 'RealWorld']
-        args.class_num = 65 
+        args.class_num = 65
     if args.dset == 'office':
         names = ['amazon', 'dslr', 'webcam']
         args.class_num = 31
@@ -388,7 +381,7 @@ if __name__ == "__main__":
     if args.dset == 'office-caltech':
         names = ['amazon', 'caltech', 'dslr', 'webcam']
         args.class_num = 10
-        
+
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
     SEED = args.seed
     torch.manual_seed(SEED)
@@ -414,8 +407,8 @@ if __name__ == "__main__":
                 args.tar_classes = [i for i in range(25)]
 
         args.output_dir_src = osp.join(args.output_src, args.da, args.dset, names[args.s][0].upper())
-        args.output_dir = osp.join(args.output, args.da, args.dset, names[args.s][0].upper()+names[args.t][0].upper())
-        args.name = names[args.s][0].upper()+names[args.t][0].upper()
+        args.output_dir = osp.join(args.output, args.da, args.dset, names[args.s][0].upper() + names[args.t][0].upper())
+        args.name = names[args.s][0].upper() + names[args.t][0].upper()
 
         if not osp.exists(args.output_dir):
             os.system('mkdir -p ' + args.output_dir)
