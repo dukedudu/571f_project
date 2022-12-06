@@ -19,6 +19,13 @@ import torch.nn.functional as F
 from collections import defaultdict
 from node2vec import Node2Vec
 
+def Entropy(input_):
+    bs = input_.size(0)
+    epsilon = 1e-5
+    entropy = -input_ * torch.log(input_ + epsilon)
+    entropy = torch.sum(entropy, dim=-1)
+    return entropy
+
 
 def op_copy(optimizer):
     for param_group in optimizer.param_groups:
@@ -121,7 +128,7 @@ def cal_acc(loader, netF, netB, netC, flag=False):
                 all_label = torch.cat((all_label, labels.float()), 0)
     _, predict = torch.max(all_output, 1)
     accuracy = torch.sum(torch.squeeze(predict).float() == all_label).item() / float(all_label.size()[0])
-    mean_ent = torch.mean(loss.Entropy(nn.Softmax(dim=1)(all_output))).cpu().data.item()
+    mean_ent = torch.mean(Entropy(nn.Softmax(dim=1)(all_output))).cpu().data.item()
 
     if flag:
         matrix = confusion_matrix(all_label, torch.squeeze(predict).float())
@@ -212,7 +219,7 @@ def train_target(args):
 
         if args.ent:
             softmax_out = nn.Softmax(dim=1)(outputs_test)
-            entropy_loss = torch.mean(loss.Entropy(softmax_out))
+            entropy_loss = torch.mean(Entropy(softmax_out))
             if args.gent:
                 msoftmax = softmax_out.mean(dim=0)
                 gentropy_loss = torch.sum(-msoftmax * torch.log(msoftmax + args.epsilon))
@@ -326,28 +333,31 @@ def train_target_node2vec(args):
         if True:
             tar_idx_batch = tar_idx.detach().clone().cpu().numpy().tolist()
             tar_idx_batch = [str(ele) for ele in tar_idx_batch]
-            neighbor = []
-            for index in tar_idx_batch:
-                n_index = int(prob_lookup.most_similar(index, topn=2)[0][0])
-                neighbor.append(n_index)
-            neighbor = torch.tensor(neighbor).cuda()
-            score_nearest = score_bank[neighbor]
-            feat_nearest = feat_bank[neighbor].float().to(torch.device("cuda:0"))
-            # prob_from_node2vec = torch.from_numpy(prob_lookup[tar_idx_batch]).float().to(torch.device("cuda:0"))
+            logit_average = 0
+            prob_average = 0
+
+            for j in range(5):
+                neighbor = []
+                # n_index = int(prob_lookup.most_similar(index, topn=5)[0][0])
+                for index in tar_idx_batch:
+                    n_index = int(prob_lookup.most_similar(index, topn=5)[j][0])
+                    neighbor.append(n_index)
+                # score_nearest = score_bank[neighbor]
+                # feat_nearest = feat_bank[neighbor].float().to(torch.device("cuda:0"))
+                logit_from_node2vec = torch.from_numpy(prob_lookup[neighbor]).float().to(torch.device("cuda:0"))
+                prob_from_node2vec = nn.Softmax(dim=1)(netC(logit_from_node2vec))
+                logit_average += logit_from_node2vec
+                prob_average += prob_from_node2vec
+            logit_average /= 5
+            prob_average /= 5
+
             # feat_dist_loss = nn.CrossEntropyLoss()(softmax_out, score_nearest.softmax(dim=1))
-            feat_dist_loss = torch.mean(nn.MSELoss()(feat_nearest, features_test))
+            feat_dist_loss = torch.mean(nn.MSELoss()(logit_average, features_test))
         else:
             feat_dist_loss = torch.tensor(0.0).to(torch.device("cuda:0"))
-        if args.cls_par > 0:
-            pred = mem_label[tar_idx]
-            classifier_loss = nn.CrossEntropyLoss()(outputs_test, pred)  # L1 loss
-            classifier_loss *= args.cls_par
-            feat_dist_loss += classifier_loss
-            if iter_num < interval_iter and args.dset == "VISDA-C":
-                feat_dist_loss *= 0
         if args.ent:
             softmax_out = nn.Softmax(dim=1)(outputs_test)
-            entropy_loss = torch.mean(loss.Entropy(softmax_out))
+            entropy_loss = torch.mean(Entropy(softmax_out))
             if args.gent:
                 msoftmax = softmax_out.mean(dim=0)
                 gentropy_loss = torch.sum(-msoftmax * torch.log(msoftmax + args.epsilon))
@@ -356,7 +366,7 @@ def train_target_node2vec(args):
             feat_dist_loss += im_loss
 
         if args.contrastive:
-            feature = torch.cat([softmax_out, score_nearest], dim=0)
+            feature = torch.cat([softmax_out, prob_average], dim=0)
             labels = torch.cat([torch.arange(softmax_out.shape[0]).repeat_interleave(1) for i in range(2)], dim=0)
             labels = (labels.unsqueeze(0) == labels.unsqueeze(1)).float()
             labels = labels.cuda()
@@ -556,11 +566,11 @@ if __name__ == "__main__":
     parser.add_argument('--gpu_id', type=str, nargs='?', default='0', help="device id to run")
     parser.add_argument('--s', type=int, default=0, help="source")
     parser.add_argument('--t', type=int, default=1, help="target")
-    parser.add_argument('--max_epoch', type=int, default=15, help="max iterations")
-    parser.add_argument('--interval', type=int, default=15)
+    parser.add_argument('--max_epoch', type=int, default=20, help="max iterations")
+    parser.add_argument('--interval', type=int, default=20)
     parser.add_argument('--batch_size', type=int, default=64, help="batch_size")
     parser.add_argument('--worker', type=int, default=4, help="number of workers")
-    parser.add_argument('--dset', type=str, default='office-home',
+    parser.add_argument('--dset', type=str, default='office',
                         choices=['VISDA-C', 'office', 'office-home', 'office-caltech'])
     parser.add_argument('--lr', type=float, default=1e-2, help="learning rate")
     parser.add_argument('--net', type=str, default='resnet50', help="alexnet, vgg16, resnet50, res101")
@@ -579,16 +589,16 @@ if __name__ == "__main__":
     parser.add_argument('--layer', type=str, default="wn", choices=["linear", "wn"])
     parser.add_argument('--classifier', type=str, default="bn", choices=["ori", "bn"])
     parser.add_argument('--distance', type=str, default='cosine', choices=["euclidean", "cosine"])
-    parser.add_argument('--output', type=str, default='san')
-    parser.add_argument('--output_src', type=str, default='san')
+    parser.add_argument('--output', type=str, default='weight')
+    parser.add_argument('--output_src', type=str, default='weight')
     parser.add_argument('--da', type=str, default='uda', choices=['uda', 'pda'])
     parser.add_argument('--issave', type=bool, default=True)
 
     # node2vec
     parser.add_argument('--cut_edges', type=bool, default=True)
-    parser.add_argument('--weight_thres', type=float, default=0.02)
+    parser.add_argument('--weight_thres', type=float, default=0.9)
     parser.add_argument('--graph_folder', type=str, default=None)
-    parser.add_argument('--walk_length', type=int, default=16)
+    parser.add_argument('--walk_length', type=int, default=12)
     parser.add_argument('--walk_num', type=int, default=128)
     parser.add_argument('--baseline', type=int, default=0)
     parser.add_argument('--enable_node2vec', type=bool, default=False)
@@ -601,7 +611,8 @@ if __name__ == "__main__":
     args.contrastive = True
 
     if args.dset == 'office-home':
-        names = ['Art', 'Clipart', 'Product', 'Real_World']
+        # names = ['Art', 'Clipart', 'Product', 'Rea_lWorld']
+        names = ['Art', 'Clipart']
         args.class_num = 65
     if args.dset == 'office':
         names = ['amazon', 'dslr', 'webcam']
@@ -626,10 +637,10 @@ if __name__ == "__main__":
             continue
         args.t = i
 
-        folder = './data/'
-        args.s_dset_path = folder + args.dset + '/' + names[args.s] + '_list.txt'
-        args.t_dset_path = folder + args.dset + '/' + names[args.t] + '_list.txt'
-        args.test_dset_path = folder + args.dset + '/' + names[args.t] + '_list.txt'
+        folder = r"C:/Users/wang0918.stu/Desktop/Datasets"
+        args.s_dset_path = folder +'/'+ args.dset + '/' + names[args.s] + '/'+ names[args.s] + '.txt'
+        args.t_dset_path = folder +'/'+ args.dset + '/' + names[args.t] + '/'+ names[args.t]+ '.txt'
+        args.test_dset_path = folder +'/'+ args.dset + '/' + names[args.t] + '/' + names[args.t] + '.txt'
 
         if args.dset == 'office-home':
             if args.da == 'pda':
