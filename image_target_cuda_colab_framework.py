@@ -19,12 +19,26 @@ import torch.nn.functional as F
 from collections import defaultdict
 from node2vec import Node2Vec
 
+
 def Entropy(input_):
     bs = input_.size(0)
     epsilon = 1e-5
     entropy = -input_ * torch.log(input_ + epsilon)
     entropy = torch.sum(entropy, dim=-1)
     return entropy
+
+
+def edge_threshold_decay(args):
+    upperbound_base = args.edge_upperbound
+    upperbound = upperbound_base - args.edge_upper_decay_rate * args.iter_num
+    lowerbound_base = args.edge_lowerbound
+    lowerbound = lowerbound_base + args.edge_lower_inc_rate * args.iter_num
+    if upperbound <= lowerbound:
+        if lowerbound < 1:
+            upperbound = lowerbound
+        else:
+            upperbound, lowerbound = 1, 1
+    return upperbound, lowerbound
 
 
 def op_copy(optimizer):
@@ -114,7 +128,7 @@ def cal_acc(loader, netF, netB, netC, flag=False):
     with torch.no_grad():
         iter_test = iter(loader)
         for i in range(len(loader)):
-            data = iter_test.next()
+            data = next(iter_test)
             inputs = data[0]
             labels = data[1]
             inputs = inputs.cuda()
@@ -184,10 +198,10 @@ def train_target(args):
 
     while iter_num < max_iter:
         try:
-            inputs_test, _, tar_idx = iter_test.next()
+            inputs_test, _, tar_idx = next(iter_test)
         except:
             iter_test = iter(dset_loaders["target"])
-            inputs_test, _, tar_idx = iter_test.next()
+            inputs_test, _, tar_idx = next(iter_test)
 
         if inputs_test.size(0) == 1:
             continue
@@ -256,7 +270,7 @@ def train_target(args):
     return netF, netB, netC
 
 
-def train_target_node2vec(args):
+def train_target_graph_encoder(args):
     criterion = nn.CrossEntropyLoss()
     dset_loaders = data_load(args)
     ## set base network
@@ -298,15 +312,15 @@ def train_target_node2vec(args):
     interval_iter = max_iter // args.interval
     iter_num = 0
     num_sample = len(dset_loaders['target'].dataset)
-    score_bank = torch.randn(num_sample, args.class_num).cuda()
-    feat_bank = torch.randn(num_sample, 256)
-    print(score_bank.size())
+    # score_bank = torch.randn(num_sample, args.class_num).cuda()
+    # feat_bank = torch.randn(num_sample, 256)
+    # print(score_bank.size())
     while iter_num < max_iter:
         try:
-            inputs_test, _, tar_idx = iter_test.next()
+            inputs_test, _, tar_idx = next(iter_test)
         except:
             iter_test = iter(dset_loaders["target"])
-            inputs_test, _, tar_idx = iter_test.next()
+            inputs_test, _, tar_idx = next(iter_test)
 
         if inputs_test.size(0) == 1:
             continue
@@ -314,9 +328,10 @@ def train_target_node2vec(args):
         if iter_num % interval_iter == 0:
             netF.eval()
             netB.eval()
-            feat_bank, score_bank, prob_lookup = obtain_vec(dset_loaders['test'], score_bank, feat_bank, netF, netB, netC, args)
-            mem_label = obtain_label(dset_loaders['test'], netF, netB, netC, args)
-            mem_label = torch.from_numpy(mem_label).cuda()
+            # feat_bank, score_bank, prob_lookup = obtain_vec(dset_loaders['test'], score_bank, feat_bank, netF, netB, netC, args)
+            prob_lookup = obtain_vec(dset_loaders['test'], netF, netB, netC, args)
+            # mem_label = obtain_label(dset_loaders['test'], netF, netB, netC, args)
+            # mem_label = torch.from_numpy(mem_label).cuda()
             netF.train()
             netB.train()
 
@@ -327,10 +342,10 @@ def train_target_node2vec(args):
 
         features_test = netB(netF(inputs_test))
         outputs_test = netC(features_test)
-        score_bank[tar_idx] = outputs_test.detach().clone()
-        feat_bank[tar_idx] = F.normalize(features_test).detach().clone().cpu()
+        # score_bank[tar_idx] = outputs_test.detach().clone()
+        # feat_bank[tar_idx] = F.normalize(features_test).detach().clone().cpu()
         softmax_out = nn.Softmax(dim=1)(outputs_test)
-        if True:
+        if args.graph_embedding_align == 1:
             tar_idx_batch = tar_idx.detach().clone().cpu().numpy().tolist()
             tar_idx_batch = [str(ele) for ele in tar_idx_batch]
             logit_average = 0
@@ -344,10 +359,10 @@ def train_target_node2vec(args):
                     neighbor.append(n_index)
                 # score_nearest = score_bank[neighbor]
                 # feat_nearest = feat_bank[neighbor].float().to(torch.device("cuda:0"))
-                logit_from_node2vec = torch.from_numpy(prob_lookup[neighbor]).float().to(torch.device("cuda:0"))
-                prob_from_node2vec = nn.Softmax(dim=1)(netC(logit_from_node2vec))
-                logit_average += logit_from_node2vec
-                prob_average += prob_from_node2vec
+                logit_from_encoder = torch.from_numpy(prob_lookup[neighbor]).float().to(torch.device("cuda:0"))
+                prob_from_encoder = nn.Softmax(dim=1)(netC(logit_from_encoder))
+                logit_average += logit_from_encoder
+                prob_average += prob_from_encoder
             logit_average /= 5
             prob_average /= 5
 
@@ -365,7 +380,7 @@ def train_target_node2vec(args):
             im_loss = entropy_loss * args.ent_par
             feat_dist_loss += im_loss
 
-        if args.contrastive:
+        if args.contrastive == 1:
             feature = torch.cat([softmax_out, prob_average], dim=0)
             labels = torch.cat([torch.arange(softmax_out.shape[0]).repeat_interleave(1) for i in range(2)], dim=0)
             labels = (labels.unsqueeze(0) == labels.unsqueeze(1)).float()
@@ -431,7 +446,7 @@ def obtain_label(loader, netF, netB, netC, args):
     with torch.no_grad():
         iter_test = iter(loader)
         for _ in range(len(loader)):
-            data = iter_test.next()
+            data = next(iter_test)
             inputs = data[0]
             labels = data[1]
             inputs = inputs.cuda()
@@ -484,17 +499,15 @@ def obtain_label(loader, netF, netB, netC, args):
     return predict.astype('int')
 
 
-def obtain_vec(loader, score_bank, feat_bank, netF, netB, netC, args):
+def obtain_vec(loader, netF, netB, netC, args):
+    print("generating node embedding")
     num_sample = len(loader.dataset)
-    # fea_bank = torch.randn(num_sample, 256)
-    # score_bank = torch.randn(num_sample, 12).cuda()
-    # score_bank = torch.randn(num_sample, 30)   # change class num
-    # office: 30; office-home: 65; visda-2017: 12
     start_test = True
+    K = 0
     with torch.no_grad():
         iter_test = iter(loader)
         for _ in range(len(loader)):
-            data = iter_test.next()
+            data = next(iter_test)
             inputs = data[0]
             labels = data[1]
             indx = data[2]
@@ -502,10 +515,6 @@ def obtain_vec(loader, score_bank, feat_bank, netF, netB, netC, args):
             feas = netF(inputs)
             feas_extract = netB(feas)
             outputs = netC(feas_extract)
-            # feature (node) and score (edge) bank update
-            # output_norm = F.normalize(feas)  # might remove
-            feat_bank[indx] = F.normalize(feas_extract).detach().clone().cpu()
-            score_bank[indx] = outputs.detach().clone()
 
             if start_test:
                 all_fea = feas.float().cpu()
@@ -517,48 +526,61 @@ def obtain_vec(loader, score_bank, feat_bank, netF, netB, netC, args):
                 all_output = torch.cat((all_output, outputs.float().cpu()), 0)
                 all_label = torch.cat((all_label, labels.float()), 0)
 
-    if True:
-        print("generating node embedding")
-        # logits = all_output.detach().clone()
-        all_output = nn.Softmax(dim=1)(all_output)
-        all_fea = (all_fea.t() / torch.norm(all_fea, p=2, dim=1)).t()
-        K = 256
-        # K = all_output.size(1)
-        edge = all_fea @ all_fea.T
-        # print(edge.size())
-        # edge_graph pass through one more softmax?
-        # self-sampling?
-        adj = edge.detach().clone().cpu().numpy()
-        # graph = nx.complete_graph(num_sample)
-        graph = nx.Graph()
-        # feature_dict = defaultdict(list)
-        # if args.node_feat_type == "logits":
-        #     feature_node = logits
-        # elif args.node_feat_type == "prob":
-        #     feature_node = all_output
-        # else:
-        #     feature_node = all_fea  # deprecated
-        # # for i, v in enumerate(all_output):
-        # for i, v in enumerate(feature_node):
-        #     feature_dict[i] = v
-        graph.add_nodes_from(np.arange(num_sample))
-        # nx.set_node_attributes(graph, feature_dict, args.node_feat_type)
+    all_output = nn.Softmax(dim=1)(all_output)
+    all_fea = (all_fea.t() / torch.norm(all_fea, p=2, dim=1)).t()
+    if args.supernode == 1:
+        print("generating class supernode...")
+        _, predict = torch.max(all_output, 1)
+        K = all_output.size(1)
+        aff = all_output.float().cpu().numpy()
+        for _ in range(2):
+            initc = aff.transpose().dot(all_fea)
+            initc = initc / (1e-8 + aff.sum(axis=0)[:, None])  # super node
+            cls_count = np.eye(K)[predict].sum(axis=0)
+            labelset = np.where(cls_count > args.threshold)
+            labelset = labelset[0]
 
-        for i in range(num_sample):
-            for j in range(num_sample):
-                if args.cut_edges and adj[i][j] < args.weight_thres:
-                    continue
+            dd = cdist(all_fea, initc[labelset], args.distance)
+            pred_label = dd.argmin(axis=1)
+            predict = labelset[pred_label]
+
+            aff = np.eye(K)[predict]
+        super_node_embedding = torch.from_numpy(initc)
+        super_node_embedding = (super_node_embedding.t() / torch.norm(super_node_embedding, p=2, dim=1)).t()
+        all_fea = torch.cat((all_fea, super_node_embedding.float().cpu()), 0)
+        print("generating class supernode complete...")
+
+    edge = all_fea @ all_fea.T
+    adj = edge.detach().clone().cpu().numpy()
+    graph = nx.Graph()
+    graph.add_nodes_from(np.arange(num_sample + (K if args.supernode == 1 else 0)))
+    if args.graph_node_feat == 1:
+        print("adding node features")
+        feature_dict = defaultdict(list)
+        feature_node = all_fea
+        for i, v in enumerate(feature_node):
+            feature_dict[i] = v
+        nx.set_node_attributes(graph, feature_dict, "feats")
+
+    print("adding node edges")
+    for i in range(num_sample):
+        # todo: edge weights
+        for j in range(num_sample):
+            if args.cut_edges and adj[i][j] < args.weight_thres:
+                continue
+            graph.add_edge(i, j)
+        if args.supernode == 1:
+            for i in range(num_sample):
+                j = predict[i] + num_sample
                 graph.add_edge(i, j)
 
-        node2vec = Node2Vec(graph, dimensions=K, temp_folder=args.graph_folder, walk_length=args.walk_length,
-                            num_walks=args.walk_length,
-                            workers=4, p=1, q=1)  # Use temp_folder for big graphs
-        model = node2vec.fit(window=5, min_count=1, batch_words=4)
-        fea_lookup = model.wv
-        print("generating node embedding complete")
-    else:
-        fea_lookup = None
-    return feat_bank, score_bank, fea_lookup
+    node2vec = Node2Vec(graph, dimensions=256, temp_folder=args.graph_folder, walk_length=args.walk_length,
+                        num_walks=args.walk_length,
+                        workers=4, p=1, q=1)  # Use temp_folder for big graphs
+    model = node2vec.fit(window=5, min_count=1, batch_words=4)
+    fea_lookup = model.wv
+    print("generating node embedding complete")
+    return fea_lookup
 
 
 if __name__ == "__main__":
@@ -594,25 +616,34 @@ if __name__ == "__main__":
     parser.add_argument('--da', type=str, default='uda', choices=['uda', 'pda'])
     parser.add_argument('--issave', type=bool, default=True)
 
-    # node2vec
+    # graph encoder
     parser.add_argument('--cut_edges', type=bool, default=True)
     parser.add_argument('--weight_thres', type=float, default=0.9)
     parser.add_argument('--graph_folder', type=str, default=None)
     parser.add_argument('--walk_length', type=int, default=12)
     parser.add_argument('--walk_num', type=int, default=128)
     parser.add_argument('--baseline', type=int, default=0)
-    parser.add_argument('--enable_node2vec', type=bool, default=False)
-    parser.add_argument('--node_feat_type', type=str, default="logits", choices=["logits", "prob", "feat"])
+    parser.add_argument('--graph_embedding_align', type=int, default=1)
+    parser.add_argument('--graph_node_feat', type=int, default=1)
+    parser.add_argument('--supernode', type=int, default=1)
+    parser.add_argument('--time_variant_thres', type=int, default=1)
 
-    # contrastive 
+    # contrastive
     parser.add_argument('--temperature', default=0.07, type=float,
                         help='softmax temperature (default: 0.07)')
+    parser.add_argument('--contrastive', default=1, type=int)
+
+    # edge theshold decay
+    parser.add_argument('--edge_upperbound', type=float, default=0.99)
+    parser.add_argument('--edge_lowerbound', type=float, default=0.5)
+    parser.add_argument('--edge_upper_decay_rate', type=float, default=1e-5)
+    parser.add_argument('--edge_lower_inc_rate', type=float, default=1e-4)
     args = parser.parse_args()
-    args.contrastive = True
+    print("heelo")
 
     if args.dset == 'office-home':
-        # names = ['Art', 'Clipart', 'Product', 'Rea_lWorld']
-        names = ['Art', 'Clipart']
+        names = ['Art', 'Real_World', 'Clipart', 'Product']
+        # names = ['Art', 'Clipart']
         args.class_num = 65
     if args.dset == 'office':
         names = ['amazon', 'dslr', 'webcam']
@@ -636,11 +667,11 @@ if __name__ == "__main__":
         if i == args.s:
             continue
         args.t = i
-
-        folder = r"C:/Users/wang0918.stu/Desktop/Datasets"
-        args.s_dset_path = folder +'/'+ args.dset + '/' + names[args.s] + '/'+ names[args.s] + '.txt'
-        args.t_dset_path = folder +'/'+ args.dset + '/' + names[args.t] + '/'+ names[args.t]+ '.txt'
-        args.test_dset_path = folder +'/'+ args.dset + '/' + names[args.t] + '/' + names[args.t] + '.txt'
+        folder = './data'
+        # folder = r"C:/Users/wang0918.stu/Desktop/Datasets"
+        args.s_dset_path = folder + '/' + args.dset + '/' + names[args.s] + '_list.txt'
+        args.t_dset_path = folder + '/' + args.dset + '/' + names[args.t] + '_list.txt'
+        args.test_dset_path = folder + '/' + args.dset + '/' + names[args.t] + '_list.txt'
 
         if args.dset == 'office-home':
             if args.da == 'pda':
@@ -668,4 +699,4 @@ if __name__ == "__main__":
         if args.baseline == 1:
             train_target(args)
         else:
-            train_target_node2vec(args)
+            train_target_graph_encoder(args)
