@@ -15,13 +15,10 @@ from tqdm import tqdm
 from scipy.spatial.distance import cdist
 from sklearn.metrics import confusion_matrix
 import torch.nn.functional as F
-import networkx as nx
-from collections import defaultdict
-#from node2vec import Node2Vec
-from torch_geometric.nn import GCN
+import time
+import torch
 
-
-# from torch_geometric.nn import Node2Vec
+import torch_geometric.nn as pyg
 
 def op_copy(optimizer):
     for param_group in optimizer.param_groups:
@@ -114,7 +111,7 @@ def cal_acc(loader, netF, netB, netC, flag=False):
             inputs = data[0]
             labels = data[1]
             inputs = inputs.cuda()
-            #inputs = inputs
+            # inputs = inputs
             outputs = netC(netB(netF(inputs)))
             if start_test:
                 all_output = outputs.float().cpu()
@@ -138,20 +135,26 @@ def cal_acc(loader, netF, netB, netC, flag=False):
         return accuracy * 100, mean_ent
 
 
-def train_target_node2vec(args):
+def train_target_graph_encoder(args):
     dset_loaders = data_load(args)
     ## set base network
     if args.net[0:3] == 'res':
         netF = network.ResBase(res_name=args.net).cuda()
-        #netF = network.ResBase(res_name=args.net)
+        # netF = network.ResBase(res_name=args.net)
     elif args.net[0:3] == 'vgg':
         netF = network.VGGBase(vgg_name=args.net).cuda()
 
-    netB = network.feat_bottleneck(type=args.classifier, feature_dim=netF.in_features, bottleneck_dim=args.bottleneck).cuda()
-    netC = network.feat_classifier(type=args.layer, class_num = args.class_num, bottleneck_dim=args.bottleneck).cuda()
-    # netB = network.feat_bottleneck(type=args.classifier, feature_dim=netF.in_features,
-    #                                bottleneck_dim=args.bottleneck)
-    # netC = network.feat_classifier(type=args.layer, class_num=args.class_num, bottleneck_dim=args.bottleneck)
+    netB = network.feat_bottleneck(type=args.classifier, feature_dim=netF.in_features,
+                                   bottleneck_dim=args.bottleneck).cuda()
+    netC = network.feat_classifier(type=args.layer, class_num=args.class_num, bottleneck_dim=args.bottleneck).cuda()
+
+    node_dimension = 256 if args.graph_from_logits == True else 2048
+    if args.graph_encoder == "gcn2l":
+        netG = network.GCNEncoder(node_dimension, 256).cuda() # 2 layers GCN
+    elif args.graph_encoder == "gcn1l":
+        netG = pyg.GCN(node_dimension, 256, 10).cuda()
+    elif args.graph_encoder == "graphsage":
+        netG = pyg.GraphSAGE(node_dimension, 256, 10).cuda()
 
     modelpath = args.output_dir_src + '/source_F.pt'
     netF.load_state_dict(torch.load(modelpath))
@@ -170,6 +173,12 @@ def train_target_node2vec(args):
         else:
             v.requires_grad = False
     for k, v in netB.named_parameters():
+        if args.lr_decay2 > 0:
+            param_group += [{'params': v, 'lr': args.lr * args.lr_decay2}]
+        else:
+            v.requires_grad = False
+    for k, v in netG.named_parameters():
+        # print(k, v)
         if args.lr_decay2 > 0:
             param_group += [{'params': v, 'lr': args.lr * args.lr_decay2}]
         else:
@@ -194,7 +203,8 @@ def train_target_node2vec(args):
         if iter_num % interval_iter == 0 and args.cls_par > 0:
             netF.eval()
             netB.eval()
-            node, edge, fea_lookup = obtain_vec(dset_loaders['test'], netF, netB, netC, args)
+            netG.eval()
+            node_fea, edge_idx, edge_weight, pos, neg = obtain_graph(dset_loaders['test'], netF, netB, netC, args)
             # mem_label = obtain_label(dset_loaders['test'], netF, netB, netC, args)
             # mem_label = torch.from_numpy(mem_label).cuda()
             # mem_label = torch.from_numpy(mem_label)
@@ -204,6 +214,7 @@ def train_target_node2vec(args):
 
             netF.train()
             netB.train()
+            netG.train()
 
         inputs_test = inputs_test.cuda()
         # inputs_test = inputs_test
@@ -213,19 +224,20 @@ def train_target_node2vec(args):
 
         features_test = netB(netF(inputs_test))
         outputs_test = netC(features_test)
+        if args.graph_encoder == "gcn1l":
+            node_embeddings = netG(node_fea.cuda(), torch.LongTensor(edge_idx).cuda(), edge_weight=torch.Tensor(edge_weight).cuda())
+        else:
+            node_embeddings = netG(node_fea.cuda(), torch.LongTensor(edge_idx).cuda())
+
         # tests:
         # update the node feature or not (should update)
 
+        # loss part 2: node embedding
         if args.cls_par > 0:  # batch level
-            # node[tar_idx] = features_test
-            # edge[tar_idx] = nn.Softmax(dim=1)(outputs_test)
-            # pred = mem_label[tar_idx]  # feature bank
-            # test 1: using numpy array
-            tar_idx_batch = tar_idx.detach().clone().cpu().numpy()
             # todo: customize mse loss
             # todo: try different losses (KL divergence)
             feat_loss = nn.MSELoss()
-            feat_dist_loss = torch.mean(feat_loss(features_test, fea_lookup[tar_idx_batch].to(torch.device("cuda:0"))))
+            feat_dist_loss = torch.mean(feat_loss(node_embeddings[tar_idx], features_test))
             feat_dist_loss *= args.cls_par
             # test 2: using tensor (no grad)
             # feat_dist_loss = nn.MSELoss()
@@ -238,6 +250,7 @@ def train_target_node2vec(args):
             # classifier_loss = torch.tensor(0.0).cuda()
             # classifier_loss = torch.tensor(0.0)
             feat_dist_loss = torch.tensor(0.0).cuda()
+        # loss part 1: imbalanced entropy
         if args.ent:
             softmax_out = nn.Softmax(dim=1)(outputs_test)
             entropy_loss = torch.mean(loss.Entropy(softmax_out))
@@ -248,6 +261,22 @@ def train_target_node2vec(args):
             im_loss = entropy_loss * args.ent_par
             # classifier_loss += im_loss
             feat_dist_loss += im_loss
+        # loss part 3: postive samples contrastive
+        if args.topk:
+            #tar_idx_batch = tar_idx.detach().clone().cpu().numpy()
+            tar_idx_lst = list(tar_idx.detach().clone().cpu().numpy())
+            pos_node_embeddings_average = 0
+            neg_node_embeddings_average = 0
+            for i in range(5):
+                pos_node_embeddings_average += node_embeddings[pos.cuda()[tar_idx_lst][:, i]]
+                neg_node_embeddings_average += node_embeddings[neg.cuda()[tar_idx_lst][:, i]]
+            pos_node_embeddings_average /= 5
+            neg_node_embeddings_average /= 5
+            if args.contrastive:
+                feat_dist_loss = torch.mean(nn.MSELoss()(pos_node_embeddings_average, features_test))
+            else:
+                feat_dist_loss = torch.mean(nn.MSELoss()(pos_node_embeddings_average, features_test)) - torch.mean(nn.MSELoss()(neg_node_embeddings_average, features_test))
+
 
         optimizer.zero_grad()
         # classifier_loss.backward()
@@ -257,6 +286,9 @@ def train_target_node2vec(args):
         if iter_num % interval_iter == 0 or iter_num == max_iter:
             netF.eval()
             netB.eval()
+            netG.eval()
+            # for k, v in netG.named_parameters():
+            #     print(k, v)
             if args.dset == 'VISDA-C':
                 acc_s_te, acc_list = cal_acc(dset_loaders['test'], netF, netB, netC, True)
                 log_str = 'Task: {}, Iter:{}/{}; Accuracy = {:.2f}%'.format(args.name, iter_num, max_iter,
@@ -270,13 +302,16 @@ def train_target_node2vec(args):
             print(log_str + '\n')
             netF.train()
             netB.train()
+            netG.train()
 
     if args.issave:
         torch.save(netF.state_dict(), osp.join(args.output_dir, "target_F_" + args.savename + ".pt"))
         torch.save(netB.state_dict(), osp.join(args.output_dir, "target_B_" + args.savename + ".pt"))
         torch.save(netC.state_dict(), osp.join(args.output_dir, "target_C_" + args.savename + ".pt"))
+        torch.save(netG.state_dict(), osp.join(args.output_dir, "target_G_" + args.savename + ".pt"))
 
-    return netF, netB, netC
+    return netF, netB, netC, netG
+
 
 def print_args(args):
     s = "==========================================\n"
@@ -285,7 +320,7 @@ def print_args(args):
     return s
 
 
-def obtain_vec(loader, netF, netB, netC, args):
+def obtain_graph(loader, netF, netB, netC, args):
     print("generating node embedding")
     num_sample = len(loader.dataset)
     # fea_bank = torch.randn(num_sample, 256)
@@ -301,9 +336,10 @@ def obtain_vec(loader, netF, netB, netC, args):
             labels = data[1]
             # indx = data[2]
             inputs = inputs.cuda()
-            #inputs = inputs
-            feas = netB(netF(inputs))
-            outputs = netC(feas)
+            # inputs = inputs
+            feas = netF(inputs)
+            feas_extract = netB(feas)
+            outputs = netC(feas_extract)
 
             # feature (node) and score (edge) bank update
             # output_norm = F.normalize(feas)  # might remove
@@ -311,12 +347,18 @@ def obtain_vec(loader, netF, netB, netC, args):
             # score_bank[indx] = outputs.detach().clone()
 
             if start_test:
-                all_fea = feas.float().cpu()
+                if args.graph_from_logits:
+                    all_fea = feas_extract.float().cpu()
+                else: # graph from features
+                    all_fea = feas.float.cpu()
                 all_output = outputs.float().cpu()
                 all_label = labels.float()
                 start_test = False
             else:
-                all_fea = torch.cat((all_fea, feas.float().cpu()), 0)
+                if args.graph_from_logits:
+                    all_fea = torch.cat((all_fea, feas_extract.float().cpu()), 0)
+                else:
+                    all_fea = torch.cat((all_fea, feas.float().cpu()), 0)
                 all_output = torch.cat((all_output, outputs.float().cpu()), 0)
                 all_label = torch.cat((all_label, labels.float()), 0)
 
@@ -343,10 +385,10 @@ def obtain_vec(loader, netF, netB, netC, args):
     edge_index.append(node_i)
     edge_index.append(node_j)
 
-    model = GCN(all_fea.size()[1], 256, 10)
-    fea_lookup = model(all_fea, torch.LongTensor(edge_index), edge_weight=torch.Tensor(edge_weight))
+    neighbors = np.argpartition(edge, -5, axis=- 1)[:, -5:]
+    negs = np.argpartition(edge, 5, axis=- 1)[:, :5]
 
-    return all_fea, edge_index, fea_lookup.detach()
+    return all_fea, edge_index, edge_weight, neighbors, negs
 
     # ent = torch.sum(-all_output * torch.log(all_output + args.epsilon), dim=1)
     # unknown_weight = 1 - ent / np.log(args.class_num)
@@ -386,10 +428,14 @@ def obtain_vec(loader, netF, netB, netC, args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='SHOT')
+    parser.add_argument('--graph_encoder', type=str, default='gcn2l', help="gcn2l, gcn1l, graphsage")
+    parser.add_argument('--graph_from_logits', type=bool, default=False, help="node features from features or logits")
+    parser.add_argument('--topk', type=bool, default=False)
+    parser.add_argument('--contrastive', type=bool, default=False)
     parser.add_argument('--gpu_id', type=str, nargs='?', default='0', help="device id to run")
     parser.add_argument('--s', type=int, default=0, help="source")
     parser.add_argument('--t', type=int, default=1, help="target")
-    parser.add_argument('--max_epoch', type=int, default=15, help="max iterations")
+    parser.add_argument('--max_epoch', type=int, default=100, help="max iterations")
     parser.add_argument('--interval', type=int, default=15)
     parser.add_argument('--batch_size', type=int, default=64, help="batch_size")
     parser.add_argument('--worker', type=int, default=0, help="number of workers")
@@ -418,8 +464,6 @@ if __name__ == "__main__":
     parser.add_argument('--issave', type=bool, default=True)
     args = parser.parse_args()
     args.output = "ckps/source/"
-    args.dset = "office"
-    args.max_epoch = 100
     args.cls_par = 0.3
     args.threshold = 10
     args.da = "uda"
@@ -427,7 +471,7 @@ if __name__ == "__main__":
     args.output = "./ckps/target/"
 
     if args.dset == 'office-home':
-        names = ['Art', 'Clipart', 'Product', 'RealWorld']
+        names = ['Art', 'Clipart', 'Product', 'Real_World']
         args.class_num = 65
     if args.dset == 'office':
         names = ['amazon', 'dslr', 'webcam']
@@ -480,4 +524,4 @@ if __name__ == "__main__":
         args.out_file.write(print_args(args) + '\n')
         args.out_file.flush()
         # train_target(args)
-        train_target_node2vec(args)
+        train_target_graph_encoder(args)
