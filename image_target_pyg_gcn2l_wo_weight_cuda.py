@@ -136,7 +136,7 @@ def cal_acc(loader, netF, netB, netC, flag=False):
         return accuracy * 100, mean_ent
 
 
-def train_target_node2vec(args):
+def train_target_graph_encoder(args):
     dset_loaders = data_load(args)
     ## set base network
     if args.net[0:3] == 'res':
@@ -147,6 +147,8 @@ def train_target_node2vec(args):
 
     netB = network.feat_bottleneck(type=args.classifier, feature_dim=netF.in_features, bottleneck_dim=args.bottleneck).cuda()
     netC = network.feat_classifier(type=args.layer, class_num = args.class_num, bottleneck_dim=args.bottleneck).cuda()
+    netG = network.GCNEncoder(256, 256).cuda()
+
     # netB = network.feat_bottleneck(type=args.classifier, feature_dim=netF.in_features,
     #                                bottleneck_dim=args.bottleneck)
     # netC = network.feat_classifier(type=args.layer, class_num=args.class_num, bottleneck_dim=args.bottleneck)
@@ -172,6 +174,12 @@ def train_target_node2vec(args):
             param_group += [{'params': v, 'lr': args.lr * args.lr_decay2}]
         else:
             v.requires_grad = False
+    for k, v in netG.named_parameters():
+      # print(k, v)
+      if args.lr_decay2 > 0:
+          param_group += [{'params': v, 'lr': args.lr * args.lr_decay2}]
+      else:
+          v.requires_grad = False
 
     optimizer = optim.SGD(param_group)
     optimizer = op_copy(optimizer)
@@ -192,7 +200,8 @@ def train_target_node2vec(args):
         if iter_num % interval_iter == 0 and args.cls_par > 0:
             netF.eval()
             netB.eval()
-            node, edge, fea_lookup = obtain_vec(dset_loaders['test'], netF, netB, netC, args)
+            netG.eval()
+            node_fea, edge_idx = obtain_graph(dset_loaders['test'], netF, netB, netC, args)
             # mem_label = obtain_label(dset_loaders['test'], netF, netB, netC, args)
             # mem_label = torch.from_numpy(mem_label).cuda()
             # mem_label = torch.from_numpy(mem_label)
@@ -202,6 +211,7 @@ def train_target_node2vec(args):
 
             netF.train()
             netB.train()
+            netG.train()
 
         inputs_test = inputs_test.cuda()
         # inputs_test = inputs_test
@@ -211,6 +221,7 @@ def train_target_node2vec(args):
 
         features_test = netB(netF(inputs_test))
         outputs_test = netC(features_test)
+        fea_lookup = netG(node_fea.to(torch.device("cuda:0")), torch.LongTensor(edge_idx).to(torch.device("cuda:0")))
         # tests:
         # update the node feature or not (should update)
 
@@ -223,7 +234,7 @@ def train_target_node2vec(args):
             # todo: customize mse loss
             # todo: try different losses (KL divergence)
             feat_loss = nn.MSELoss()
-            feat_dist_loss = torch.mean(feat_loss(features_test, fea_lookup[tar_idx_batch].to(torch.device("cuda:0"))))
+            feat_dist_loss = torch.mean(feat_loss(fea_lookup[tar_idx_batch].to(torch.device("cuda:0")), features_test))
             feat_dist_loss *= args.cls_par
             # test 2: using tensor (no grad)
             # feat_dist_loss = nn.MSELoss()
@@ -255,6 +266,9 @@ def train_target_node2vec(args):
         if iter_num % interval_iter == 0 or iter_num == max_iter:
             netF.eval()
             netB.eval()
+            netG.eval()
+            # for k, v in netG.named_parameters():
+            #     print(k, v)
             if args.dset == 'VISDA-C':
                 acc_s_te, acc_list = cal_acc(dset_loaders['test'], netF, netB, netC, True)
                 log_str = 'Task: {}, Iter:{}/{}; Accuracy = {:.2f}%'.format(args.name, iter_num, max_iter,
@@ -268,13 +282,15 @@ def train_target_node2vec(args):
             print(log_str + '\n')
             netF.train()
             netB.train()
+            netG.train()
 
     if args.issave:
         torch.save(netF.state_dict(), osp.join(args.output_dir, "target_F_" + args.savename + ".pt"))
         torch.save(netB.state_dict(), osp.join(args.output_dir, "target_B_" + args.savename + ".pt"))
         torch.save(netC.state_dict(), osp.join(args.output_dir, "target_C_" + args.savename + ".pt"))
+        torch.save(netG.state_dict(), osp.join(args.output_dir, "target_G_" + args.savename + ".pt"))
 
-    return netF, netB, netC
+    return netF, netB, netC, netG
 
 def print_args(args):
     s = "==========================================\n"
@@ -283,7 +299,7 @@ def print_args(args):
     return s
 
 
-def obtain_vec(loader, netF, netB, netC, args):
+def obtain_graph(loader, netF, netB, netC, args):
     print("generating node embedding")
     num_sample = len(loader.dataset)
     # fea_bank = torch.randn(num_sample, 256)
@@ -300,8 +316,9 @@ def obtain_vec(loader, netF, netB, netC, args):
             # indx = data[2]
             inputs = inputs.cuda()
             #inputs = inputs
-            feas = netB(netF(inputs))
-            outputs = netC(feas)
+            feas = netF(inputs)
+            feas_extract = netB(feas)
+            outputs = netC(feas_extract)
 
             # feature (node) and score (edge) bank update
             # output_norm = F.normalize(feas)  # might remove
@@ -309,12 +326,12 @@ def obtain_vec(loader, netF, netB, netC, args):
             # score_bank[indx] = outputs.detach().clone()
 
             if start_test:
-                all_fea = feas.float().cpu()
+                all_fea = feas_extract.float().cpu()
                 all_output = outputs.float().cpu()
                 all_label = labels.float()
                 start_test = False
             else:
-                all_fea = torch.cat((all_fea, feas.float().cpu()), 0)
+                all_fea = torch.cat((all_fea, feas_extract.float().cpu()), 0)
                 all_output = torch.cat((all_output, outputs.float().cpu()), 0)
                 all_label = torch.cat((all_label, labels.float()), 0)
 
@@ -341,17 +358,12 @@ def obtain_vec(loader, netF, netB, netC, args):
     
     # print("before model init")
     # print(time.time())
-
-    model = network.GCNEncoder(all_fea.size()[1], 256).to(torch.device("cuda:0"))
-
     # print("model inited")
     # print(time.time())
-
-    fea_lookup = model(all_fea.to(torch.device("cuda:0")), torch.LongTensor(edge_index).to(torch.device("cuda:0")))
     # print("model forwarded")
     # print(time.time())
 
-    return all_fea, edge_index, fea_lookup.detach()
+    return all_fea, edge_index
 
     # ent = torch.sum(-all_output * torch.log(all_output + args.epsilon), dim=1)
     # unknown_weight = 1 - ent / np.log(args.class_num)
@@ -394,7 +406,7 @@ if __name__ == "__main__":
     parser.add_argument('--gpu_id', type=str, nargs='?', default='0', help="device id to run")
     parser.add_argument('--s', type=int, default=0, help="source")
     parser.add_argument('--t', type=int, default=1, help="target")
-    parser.add_argument('--max_epoch', type=int, default=15, help="max iterations")
+    parser.add_argument('--max_epoch', type=int, default=100, help="max iterations")
     parser.add_argument('--interval', type=int, default=15)
     parser.add_argument('--batch_size', type=int, default=64, help="batch_size")
     parser.add_argument('--worker', type=int, default=0, help="number of workers")
@@ -423,7 +435,6 @@ if __name__ == "__main__":
     parser.add_argument('--issave', type=bool, default=True)
     args = parser.parse_args()
     args.output = "ckps/source/"
-    args.max_epoch = 100
     args.cls_par = 0.3
     args.threshold = 10
     args.da = "uda"
@@ -431,7 +442,7 @@ if __name__ == "__main__":
     args.output = "./ckps/target/"
 
     if args.dset == 'office-home':
-        names = ['Art', 'Clipart', 'Product', 'RealWorld']
+        names = ['Art', 'Clipart', 'Product', 'Real_World']
         args.class_num = 65
     if args.dset == 'office':
         names = ['amazon', 'dslr', 'webcam']
