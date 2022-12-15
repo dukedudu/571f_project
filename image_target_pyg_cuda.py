@@ -350,7 +350,7 @@ def obtain_graph(loader, netF, netB, netC, args):
                 if args.graph_from_logits:
                     all_fea = feas_extract.float().cpu()
                 else: # graph from features
-                    all_fea = feas.float.cpu()
+                    all_fea = feas.float().cpu()
                 all_output = outputs.float().cpu()
                 all_label = labels.float()
                 start_test = False
@@ -429,9 +429,9 @@ def obtain_graph(loader, netF, netB, netC, args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='SHOT')
     parser.add_argument('--graph_encoder', type=str, default='gcn2l', help="gcn2l, gcn1l, graphsage")
-    parser.add_argument('--graph_from_logits', type=bool, default=False, help="node features from features or logits")
-    parser.add_argument('--topk', type=bool, default=False)
-    parser.add_argument('--contrastive', type=bool, default=False)
+    parser.add_argument('--graph_from_logits', type=int, default=0, help="node features from features or logits")
+    parser.add_argument('--topk', type=int, default=0)
+    parser.add_argument('--contrastive', type=int, default=0)
     parser.add_argument('--gpu_id', type=str, nargs='?', default='0', help="device id to run")
     parser.add_argument('--s', type=int, default=0, help="source")
     parser.add_argument('--t', type=int, default=1, help="target")
